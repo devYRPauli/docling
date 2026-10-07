@@ -596,23 +596,19 @@ def _add_odf_rich_block(
 def _add_odf_heading(
     doc: DoclingDocument,
     element: Header,
+    runs: list[_OdfTextRun],
     *,
     parent: NodeItem | None,
     content_layer: ContentLayer | None,
-    odf_obj: OdfDocument | None,
-    comments: _OdfComments | None = None,
-) -> None:
+) -> NodeItem | None:
     level = max(1, element.get_attribute_integer("text:outline-level") or 1)
-    runs = _odf_text_runs(element, odf_obj)
-    item = _add_odf_rich_block(
+    return _add_odf_rich_block(
         doc,
         runs,
         add_block=lambda **kwargs: doc.add_heading(level=level, **kwargs),
         parent=parent,
         content_layer=content_layer,
     )
-    if comments is not None:
-        comments.attach(doc, item, [element])
 
 
 def _odf_paragraph_style_names(
@@ -676,7 +672,11 @@ def _add_odf_paragraph(
         return
 
     style_names = _odf_paragraph_style_names(odf_obj, element)
-    if "Title" in style_names:
+    if isinstance(element, Header):
+        item = _add_odf_heading(
+            doc, element, runs, parent=parent, content_layer=content_layer
+        )
+    elif "Title" in style_names:
         item = _add_odf_rich_block(
             doc,
             runs,
@@ -1073,16 +1073,8 @@ def _add_odf_child(
     image_loader: ImageResourceLoader | None = None,
     comments: _OdfComments | None = None,
 ) -> _OdfListState | None:
-    if isinstance(element, Header):
-        _add_odf_heading(
-            doc,
-            element,
-            parent=parent,
-            content_layer=content_layer,
-            odf_obj=odf_obj,
-            comments=comments,
-        )
-    elif isinstance(element, Paragraph) and not isinstance(element, Header):
+    # A Header is a Paragraph, so a heading adds its pictures here too.
+    if isinstance(element, Paragraph):
         _add_odf_paragraph(
             doc,
             element,
@@ -1719,8 +1711,8 @@ class OdtDocumentBackend(_OdfBaseBackend):
 
         Returns the comments as threads: a comment, then its replies. Each entry
         uses the '[author: Name (initials), time: date]: text' form of the DOCX
-        backend. A thread is keyed by the paragraph or heading around its first
-        comment.
+        backend. A thread is keyed by the outermost paragraph or heading around
+        its first comment. In a footnote, the search stops at the footnote body.
         """
         body = self.odf_obj.body
         # The walk drops deleted tracked-change text, so drop its comments too.
@@ -1731,9 +1723,15 @@ class OdtDocumentBackend(_OdfBaseBackend):
         comments: list[tuple[str | None, str | None, str]] = []
         anchors: list[Element | None] = []
         for annotation in body.get_elements("descendant::office:annotation"):
-            anchor = annotation.parent
-            while anchor is not None and anchor.tag not in ("text:p", "text:h"):
-                anchor = anchor.parent
+            # The text of a paragraph includes the paragraphs of a text box in
+            # it, so the outermost paragraph makes the item. A footnote body
+            # makes an item of its own.
+            anchor = None
+            node = annotation.parent
+            while node is not None and node.tag != "text:note-body":
+                if node.tag in ("text:p", "text:h"):
+                    anchor = node
+                node = node.parent
             metadata: list[str] = []
             creator = annotation.get_element("dc:creator")
             if creator is not None and creator.text:
@@ -1980,9 +1978,9 @@ class OdpDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
                 _add_odf_heading(
                     doc,
                     el,
+                    _odf_text_runs(el, self.odf_obj),
                     parent=parent,
                     content_layer=None,
-                    odf_obj=self.odf_obj,
                 )
             elif isinstance(el, Paragraph):
                 previous_list_state = None

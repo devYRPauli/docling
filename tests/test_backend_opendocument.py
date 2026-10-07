@@ -965,6 +965,119 @@ def test_odt_annotation_in_picture_paragraph_goes_to_picture(tmp_path: Path):
     )
 
 
+def _odt_comment(text: str) -> str:
+    return (
+        "<office:annotation><dc:creator>Ann Reviewer</dc:creator>"
+        f"<text:p>{text}</text:p></office:annotation>"
+    )
+
+
+def test_odt_annotation_in_text_box_goes_to_outer_paragraph(tmp_path: Path):
+    """The item of a paragraph includes the text boxes in it, so a comment in a
+    text box is a child of that item. A text box with an image and a caption
+    makes a picture and a text item, and the text item holds the comment. A
+    text box with only an image makes only a picture, which holds the comment.
+    The image comes from text_document_02.odt."""
+
+    def text_box(content: str) -> str:
+        return (
+            '<draw:frame text:anchor-type="as-char"><draw:text-box>'
+            f"<text:p>{content}</text:p></draw:text-box></draw:frame>"
+        )
+
+    source = OdfDocument("tests/data/odf/sources/text_document_02.odt")
+    body = source.body
+    image = {frame.name: frame.clone for frame in body.get_frames()}["Image1"]
+    body.clear()
+    for outer, inner, with_image in [
+        ("Before {} after.", f"Boxed{_odt_comment('Shorten.')}", False),
+        ("{}", f"Only boxed{_odt_comment('Move.')}", False),
+        ("{}", f"Figure 1: A caption{_odt_comment('Renumber.')}", True),
+        ("{}", _odt_comment("Crop this."), True),
+    ]:
+        paragraph = Element.from_tag(
+            f"<text:p>{outer.format(text_box(inner))}</text:p>"
+        )
+        if with_image:
+            paragraph.get_element("descendant::draw:text-box/text:p").append(
+                image.clone
+            )
+        body.append(paragraph)
+    path = tmp_path / "text_box_comment.odt"
+    source.save(str(path))
+
+    document = (
+        DocumentConverter(allowed_formats=[InputFormat.ODT]).convert(path).document
+    )
+
+    assert [
+        (group.parent.cref, group.children[0].resolve(document).text)
+        for group in document.groups
+        if group.label == GroupLabel.COMMENT_SECTION
+    ] == [
+        ("#/texts/0", "[author: Ann Reviewer]: Shorten."),
+        ("#/texts/2", "[author: Ann Reviewer]: Move."),
+        ("#/texts/4", "[author: Ann Reviewer]: Renumber."),
+        ("#/pictures/1", "[author: Ann Reviewer]: Crop this."),
+    ]
+    assert [
+        (item.text, item.comments)
+        for item in document.texts
+        if item.content_layer == ContentLayer.BODY
+    ] == [
+        ("Before Boxed after.", [FineRef(cref="#/groups/0")]),
+        ("Only boxed", [FineRef(cref="#/groups/1")]),
+        ("Figure 1: A caption", [FineRef(cref="#/groups/2")]),
+    ]
+    assert [picture.comments for picture in document.pictures] == [
+        [],
+        [FineRef(cref="#/groups/3")],
+    ]
+
+
+def test_odt_heading_adds_its_pictures(tmp_path: Path):
+    """A heading adds its pictures before its own item, as a paragraph does. A
+    comment in a heading with only an image is a child of the picture. A
+    heading with text keeps the comment on the heading. The image comes from
+    text_document_02.odt."""
+    source = OdfDocument("tests/data/odf/sources/text_document_02.odt")
+    body = source.body
+    image = {frame.name: frame.clone for frame in body.get_frames()}["Image1"]
+    body.clear()
+    for text, comment in [("", "Crop this."), ("Results", "Rename.")]:
+        heading = Element.from_tag(
+            f'<text:h text:outline-level="1">{text}{_odt_comment(comment)}</text:h>'
+        )
+        heading.append(image.clone)
+        body.append(heading)
+    path = tmp_path / "heading_picture.odt"
+    source.save(str(path))
+
+    document = (
+        DocumentConverter(allowed_formats=[InputFormat.ODT]).convert(path).document
+    )
+
+    assert document.export_to_markdown() == (
+        "<!-- image -->\n\n<!-- image -->\n\n## Results"
+    )
+    assert [
+        (group.parent.cref, group.children[0].resolve(document).text)
+        for group in document.groups
+        if group.label == GroupLabel.COMMENT_SECTION
+    ] == [
+        ("#/pictures/0", "[author: Ann Reviewer]: Crop this."),
+        ("#/texts/1", "[author: Ann Reviewer]: Rename."),
+    ]
+    assert [picture.comments for picture in document.pictures] == [
+        [FineRef(cref="#/groups/0")],
+        [],
+    ]
+    assert (document.texts[1].text, document.texts[1].comments) == (
+        "Results",
+        [FineRef(cref="#/groups/1")],
+    )
+
+
 @pytest.mark.parametrize(
     ("kind", "expected_label", "expected_markdown"),
     [
